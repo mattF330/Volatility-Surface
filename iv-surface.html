@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Implied Volatility Surface</title>
+<style>
+  :root {
+    --bg: #FFFFFF; --ink: #161616; --dim: #777777; --line: #E3E3E3; --accent: #2B5FA8;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #111111; --ink: #EDEDED; --dim: #8A8A8A; --line: #2C2C2C; --accent: #7FA8E0; }
+  }
+  :root[data-theme="dark"] { --bg: #111111; --ink: #EDEDED; --dim: #8A8A8A; --line: #2C2C2C; --accent: #7FA8E0; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 40px; }
+  h1 { font-size: 1.15rem; font-weight: 600; margin: 0 0 4px; }
+  .lede { color: var(--dim); font-size: 0.85rem; margin: 0 0 20px; }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }
+  select, button {
+    font: inherit; font-size: 0.85rem; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 4px; padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  .meta { color: var(--dim); font-size: 0.8rem; }
+  .cmp { border-collapse: collapse; margin-bottom: 14px; font-size: 0.85rem; }
+  .cmp th { font-weight: 400; color: var(--ink); font-size: 0.8rem; text-align: right; padding: 3px 0 3px 26px; }
+  .cmp th:first-child, .cmp td:first-child { text-align: left; padding-left: 0; }
+  .cmp td { font-family: var(--mono); text-align: right; padding: 3px 0 3px 26px; }
+  .cmp td:first-child { font-family: var(--font); color: var(--dim); font-size: 0.78rem; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .chk { font-size: 0.85rem; display: inline-flex; align-items: center; gap: 6px; }
+  select[hidden] { display: none; }
+  canvas { display: block; width: 100%; height: 440px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  .foot { color: var(--dim); font-size: 0.75rem; margin-top: 12px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Implied Volatility Surface</h1>
+  <p class="lede">Modeled IV by strike and expiry. Drag to rotate, or tick Compare to overlay two tickers on the same scale.</p>
+
+  <div class="controls">
+    <select id="ticker" aria-label="Ticker"></select>
+    <label class="chk"><input type="checkbox" id="cmpOn"> Compare</label>
+    <select id="ticker2" aria-label="Compare ticker" hidden></select>
+    <button id="reset">Reset view</button>
+  </div>
+
+  <table class="cmp" id="cmp"></table>
+
+  <canvas id="c"></canvas>
+
+  <p class="foot">Parametric model (skew + curvature + mean-reverting term structure) using illustrative per-ticker levels. These are not live option prices or calibrated market quotes.</p>
+</div>
+
+<script>
+// sector, skew, curvature, "TICKER:typical ATM vol %"
+const DATA = [
+ ['Semiconductors & hardware', -0.45, 0.50, 'NVDA:50 AVGO:42 AMD:55'],
+ ['Software & internet', -0.40, 0.45, 'META:38 AMZN:33 GOOGL:30 NFLX:38 PLTR:65 ORCL:38'],
+ ['Autos & industrials', -0.40, 0.50, 'TSLA:58'],
+];
+const TICKERS = {};
+const sel = document.getElementById('ticker'), sel2 = document.getElementById('ticker2');
+const cmpOn = document.getElementById('cmpOn');
+DATA.forEach(([sector, skew, curv, str]) => {
+  const g = document.createElement('optgroup'); g.label = sector;
+  str.split(' ').forEach(p => {
+    const [t, v] = p.split(':');
+    TICKERS[t] = { sector, skew, curv, base: +v / 100 };
+    const o = document.createElement('option'); o.value = t; o.textContent = t; g.appendChild(o);
+  });
+  sel.appendChild(g); sel2.appendChild(g.cloneNode(true));
+});
+
+const EXP = [7, 14, 21, 30, 45, 60, 90, 120, 150, 180, 270, 365, 545, 730];
+const MON = Array.from({ length: 25 }, (_, i) => 0.70 + i * 0.025);
+
+function iv(tk, m, days) {
+  const T = days / 365, k = Math.log(m);
+  const lr = 0.55 * tk.base + 0.45 * 0.30;                 // long-run level pulled toward 30%
+  const atm = lr + (tk.base - lr) * Math.exp(-T / 0.5);    // mean-reverting term structure
+  const Tf = Math.max(T, 0.04);
+  const v = atm * (1 + tk.skew * k / Math.pow(Tf, 0.35) + tk.curv * k * k / Math.pow(Tf, 0.5));
+  return Math.min(Math.max(v, 0.05), 3);
+}
+
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+let yaw = -0.6, pitch = 0.55, surfaces = [], zmin = 0, zmax = 1;
+
+const COLORS = ['#4A7FC1', '#D9782E'];
+function build() {
+  const names = [sel.value];
+  if (cmpOn.checked) names.push(sel2.value);
+  sel2.hidden = !cmpOn.checked;
+  surfaces = names.map(n => ({ name: n, ivs: EXP.map(d => MON.map(m => iv(TICKERS[n], m, d))) }));
+  const flat = surfaces.flatMap(s => s.ivs.flat());
+  zmin = Math.min(...flat); zmax = Math.max(...flat);
+  const pct = v => (v * 100).toFixed(1) + '%';
+  const pts = v => (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + ' pts';
+  const rows = [
+    ['Sector', n => TICKERS[n].sector, null],
+    ['ATM IV · 30d', n => iv(TICKERS[n], 1, 30), pct],
+    ['Skew · 90/110, 30d', n => iv(TICKERS[n], 0.9, 30) - iv(TICKERS[n], 1.1, 30), pts],
+    ['Term slope · 6m–1m', n => iv(TICKERS[n], 1, 180) - iv(TICKERS[n], 1, 30), pts],
+  ];
+  const two = names.length === 2;
+  let html = '<tr><th></th>' + names.map((n, i) => `<th><span class="dot" style="background:${COLORS[i]}"></span>${n}</th>`).join('') + (two ? '<th>Δ (B–A)</th>' : '') + '</tr>';
+  rows.forEach(([label, f, fmt]) => {
+    html += `<tr><td>${label}</td>` + names.map(n => `<td>${fmt ? fmt(f(n)) : f(n)}</td>`).join('');
+    if (two) html += `<td>${fmt ? pts(f(names[1]) - f(names[0])) : ''}</td>`;
+    html += '</tr>';
+  });
+  document.getElementById('cmp').innerHTML = html;
+  draw();
+}
+
+function isDark() {
+  const t = document.documentElement.dataset.theme;
+  return t === 'dark' || (t !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const cs = getComputedStyle(document.documentElement);
+  const line = cs.getPropertyValue('--line').trim(), dim = cs.getPropertyValue('--dim').trim();
+  const dark = isDark();
+  const S = Math.min(w * 0.30, h * 0.40), cx = w / 2, cy = h / 2 + 10;
+  const cosY = Math.cos(yaw), sinY = Math.sin(yaw), cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+  const nm = MON.length, nt = EXP.length, span = zmax - zmin || 1;
+
+  function proj(x, y, z) {
+    const x1 = x * cosY - y * sinY, y1 = x * sinY + y * cosY;
+    const y2 = y1 * cosP - z * sinP, z2 = y1 * sinP + z * cosP;
+    return { x: cx + x1 * S, y: cy - z2 * S, d: y2 };
+  }
+  const X = j => (j / (nm - 1)) * 2 - 1, Y = i => (i / (nt - 1)) * 2 - 1;
+  const Z = v => ((v - zmin) / span - 0.5);
+
+  const quads = [];
+  surfaces.forEach((s, si) => {
+    for (let i = 0; i < nt - 1; i++) for (let j = 0; j < nm - 1; j++) {
+      const p = [[i, j], [i, j + 1], [i + 1, j + 1], [i + 1, j]].map(([a, b]) => proj(X(b), Y(a), Z(s.ivs[a][b])));
+      const avg = (s.ivs[i][j] + s.ivs[i][j + 1] + s.ivs[i + 1][j] + s.ivs[i + 1][j + 1]) / 4;
+      quads.push({ p, si, d: (p[0].d + p[1].d + p[2].d + p[3].d) / 4, t: (avg - zmin) / span });
+    }
+  });
+  quads.sort((a, b) => b.d - a.d);
+
+  // base outline
+  ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.beginPath();
+  [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([x, y], k) => { const q = proj(x, y, -0.5); k ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); });
+  ctx.closePath(); ctx.stroke();
+
+  quads.forEach(q => {
+    const L = dark ? 24 + q.t * 42 : 90 - q.t * 48;
+    ctx.fillStyle = `hsl(${q.si ? 24 : 212}, 45%, ${L}%)`;
+    ctx.globalAlpha = surfaces.length > 1 ? 0.82 : 1;
+    ctx.strokeStyle = line; ctx.lineWidth = 0.6;
+    ctx.beginPath(); q.p.forEach((pt, k) => k ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  });
+
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = dim; ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+  ctx.textAlign = 'center';
+  [[-1, '0.70'], [0, '1.00'], [1, '1.30']].forEach(([x, s]) => { const q = proj(x, -1.18, -0.5); ctx.fillText(s, q.x, q.y); });
+  const mn = proj(0, -1.4, -0.5); ctx.fillText('Strike / spot', mn.x, mn.y);
+  [[-1, '1W'], [0, '6M'], [1, '2Y']].forEach(([y, s]) => { const q = proj(1.2, y, -0.5); ctx.fillText(s, q.x, q.y); });
+  const et = proj(1.45, 0, -0.5); ctx.fillText('Expiry', et.x, et.y);
+  ctx.textAlign = 'right';
+  const hi = proj(-1.1, -1.1, 0.5), lo = proj(-1.1, -1.1, -0.5);
+  ctx.fillText((zmax * 100).toFixed(0) + '%', hi.x, hi.y);
+  ctx.fillText((zmin * 100).toFixed(0) + '%', lo.x, lo.y);
+}
+
+let drag = null;
+canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  yaw += (e.clientX - drag.x) * 0.008;
+  pitch = Math.min(1.4, Math.max(0.1, pitch + (e.clientY - drag.y) * 0.008));
+  drag = { x: e.clientX, y: e.clientY };
+  draw();
+});
+['pointerup', 'pointercancel'].forEach(ev => canvas.addEventListener(ev, () => { drag = null; }));
+
+[sel, sel2, cmpOn].forEach(el => el.addEventListener('change', build));
+document.getElementById('reset').addEventListener('click', () => { yaw = -0.6; pitch = 0.55; draw(); });
+window.addEventListener('resize', draw);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+sel.value = 'NVDA'; sel2.value = 'AMD';
+build();
+</script>
+</body>
+</html>
